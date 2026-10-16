@@ -48,6 +48,9 @@ ipython_config.py
 # Other
 /nppBackup
 
+# AI coding assistants (local agent state)
+.workbuddy/
+
 # ==========================================
 # Environment & Secrets (Critical)
 # ==========================================
