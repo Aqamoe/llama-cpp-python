@@ -61,6 +61,118 @@ def _format_library_dir_contents(base_paths: list[pathlib.Path]) -> str:
 
     return "\n".join(sections)
 
+def _win32_error_text(code: int) -> str:
+    """把 Win32 错误码转成系统文案（中文系统给中文）。"""
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        got = ctypes.windll.kernel32.FormatMessageW(
+            0x00001000,  # FORMAT_MESSAGE_FROM_SYSTEM
+            None, code, 0, buf, 512, None)
+        return buf.value.strip() if got else ""
+    except Exception:
+        return ""
+
+
+# 已知的 Win32 加载失败语义 —— 把 "Failed to load dynlib/dll" 变成可定位的原因。
+# 注：126/127 是 Windows 上最常见的"间接依赖"失败：文件本身存在，但它的某个
+# 依赖不可用（缺文件 → 126；缺导出符号/版本过旧 → 127），报错文案里那个
+# "was not found" 指的是文件的依赖，不是文件自己。
+_WIN32_LOAD_HINTS = {
+    126: "依赖的 DLL 缺失（模块找不到）",
+    127: "文件找到了但缺少所需导出函数（版本过旧或被替换）",
+    193: "架构不匹配（例如 64 位进程里加载了 32 位 DLL）",
+    5: "被安全软件/策略拦截（拒绝访问）",
+    225: "被安全软件拦截（文件被标记为病毒）",
+    1114: "DLL 已找到但初始化失败（依赖组件损坏）",
+}
+
+# 需要额外探测的系统依赖：llama.cpp 的 Vulkan 后端的导入链是
+# ggml.dll → ggml-vulkan.dll → 系统的 vulkan-1.dll，只要系统里那份
+# vulkan-1.dll 缺失/过旧/被拦，ggml.dll 就会整体加载失败（与是否走 GPU 无关）。
+_WIN32_SYSTEM_DEPS = ("vulkan-1.dll",)
+
+
+def _win32_load_error_code(path: str) -> int:
+    """用 LoadLibraryExW 复现一次失败，取回真实 Win32 错误码。
+
+    必要性：PyInstaller 冻结包里 ctypes 抛出的 OSError 往往不带 winerror
+    （只剩 "Failed to load dynlib/dll ... frozen" 这条通用文案），而普通
+    Python 下是带的。自己调一次 LoadLibraryExW 才能拿到 126/127/193/1114
+    这类能定位问题的错误码。
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LoadLibraryExW.restype = ctypes.c_void_p
+        kernel32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p,
+                                            ctypes.c_uint32]
+        if kernel32.LoadLibraryExW(path, None, 0):
+            return 0  # 复现不出来（上一步失败是瞬时的），不猜测
+        return ctypes.get_last_error() or 0
+    except Exception:  # noqa: BLE001 - 诊断路径
+        return 0
+
+
+def _win32_format_error(exc: BaseException, lib_path=None) -> str:
+    """把 CDLL 抛出的 OSError 变成带 Win32 错误码/文案/解读的一行。"""
+    if sys.platform != "win32":
+        return str(exc)
+    code = getattr(exc, "winerror", None) or 0
+    if not code and lib_path:
+        code = _win32_load_error_code(str(lib_path))
+    if not code:
+        return str(exc)
+    parts = [f"winerror={code}"]
+    text = _win32_error_text(code)
+    if text:
+        parts.append(text)
+    hint = _WIN32_LOAD_HINTS.get(code, "")
+    if hint:
+        parts.append(hint)
+    return f"{exc} [{'；'.join(parts)}]"
+
+
+def _win32_probe_dll(name: str) -> str:
+    """探测某个 DLL 在当前进程里会被解析到哪个文件（解析不到就报错误码）。
+
+    仅在加载失败的诊断路径上调用：用来回答"到底缺了什么"。探测会真实加载
+    该 DLL，但此时 import 已经注定失败，没有副作用需要考虑。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LoadLibraryExW.restype = ctypes.c_void_p
+        kernel32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p,
+                                            ctypes.c_uint32]
+        handle = kernel32.LoadLibraryExW(name, None, 0)
+        if not handle:
+            code = ctypes.get_last_error()
+            text = _win32_error_text(code)
+            return (f"{name}: 无法加载 (winerror={code}"
+                    + (f" {text}" if text else "") + ")")
+        buf = ctypes.create_unicode_buffer(1024)
+        kernel32.GetModuleFileNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                                ctypes.c_uint32]
+        kernel32.GetModuleFileNameW(handle, buf, 1024)
+        path = buf.value
+        size = ""
+        try:
+            size = f", {os.path.getsize(path)} 字节"
+        except OSError:
+            pass
+        return f"{name}: 已解析为 {path}{size}"
+    except Exception as e:  # noqa: BLE001 - 诊断路径，任何异常都不该再抛
+        return f"{name}: 探测失败 ({e})"
+
+
+def _win32_system_dep_probe() -> str:
+    """把 llama.cpp 依赖的系统 DLL 解析情况拼成一段可读文本。"""
+    if sys.platform != "win32":
+        return ""
+    lines = [f"  - {_win32_probe_dll(name)}" for name in _WIN32_SYSTEM_DEPS]
+    return "\n".join(lines)
+
+
 # Load the library
 def load_shared_library(lib_base_name: str, base_paths: Union[pathlib.Path, list[pathlib.Path]]):
     if isinstance(base_paths, pathlib.Path):
@@ -164,7 +276,7 @@ def load_shared_library(lib_base_name: str, base_paths: Union[pathlib.Path, list
             print(f"[llama-cpp-python].find_library: loaded library from {lib_path}")
             return lib
         except Exception as e:
-            errors.append(f"{lib_path}: {e}")
+            errors.append(f"{lib_path}: {_win32_format_error(e, lib_path)}")
 
     # Then fallback to manually checking the list of paths.
     for base_path in base_paths:
@@ -177,15 +289,22 @@ def load_shared_library(lib_base_name: str, base_paths: Union[pathlib.Path, list
                     print(f"[llama-cpp-python].provided_path: loaded library from {lib_path}")
                     return lib
                 except Exception as e:
-                    errors.append(f"{lib_path}: {e}")
+                    errors.append(f"{lib_path}: {_win32_format_error(e, lib_path)}")
 
     # Include directory contents only in the failure path to avoid extra work during successful imports.
-    raise RuntimeError(
+    message = (
         f"Failed to load '{lib_base_name}' from {base_paths}\n"
         + "\n".join(errors)
         + "\nLibrary search path contents:\n"
         + _format_library_dir_contents(base_paths)
     )
+    # Windows 上再多加一段"系统依赖解析结果"：绝大多数加载失败其实是某个
+    # 间接依赖（如 vulkan-1.dll）不可用，这段能把真凶直接写进日志。
+    if sys.platform == "win32":
+        probe = _win32_system_dep_probe()
+        if probe:
+            message += "\nSystem dependency probe:\n" + probe
+    raise RuntimeError(message)
 
 
 # ctypes sane type hint helpers
